@@ -2,122 +2,133 @@
 #
 # fix-emsign-g3only.sh
 #
-# Keep emSign ECC Root CA - G3 blocked (Mozilla Bug 2083449),
-# restore trust for C3 / C1 / G1 which are unrelated to the incident.
+# Idempotent remediation for the emSign trust store:
+#   - emSign ECC Root CA - G3  -> BLOCKED  (Mozilla Bug 2083449)
+#   - emSign ECC Root CA - C3  -> trusted
+#   - emSign Root CA - C1      -> trusted
+#   - emSign Root CA - G1      -> trusted
 #
-# Supported: Debian / Ubuntu (ca-certificates.conf + update-ca-certificates)
+# Safe on clean / polluted / already-fixed systems. Re-running is a no-op.
+#
+# Targets: Debian / Ubuntu (and derivatives) using ca-certificates.conf
+#          + update-ca-certificates.
+#
 # License: MIT
 #
-set -e
-
-[[ "$(id -u)" -eq 0 ]] || { echo "[x] run as root (sudo)"; exit 3; }
+set -euo pipefail
 
 CONF=/etc/ca-certificates.conf
-BUNDLE=/etc/ssl/certs/ca-certificates.crt
+SRC=/usr/share/ca-certificates/mozilla
+CERTS=/etc/ssl/certs
+BUNDLE=$CERTS/ca-certificates.crt
 TS=$(date +%Y%m%d-%H%M%S)
 BK=/var/backups/emsign-g3only-$TS
+
+log()  { printf '[%s] %s\n' "$1" "$2"; }
+info() { log ' *' "$*"; }
+ok()   { log ' +' "$*"; }
+warn() { log ' !' "$*"; }
+err()  { log ' x' "$*" >&2; }
+
+# ---- preflight -------------------------------------------------------------
+[[ "$(id -u)" -eq 0 ]] || { err "must be run as root (try: sudo bash $0)"; exit 3; }
+[[ -f "$CONF" ]] || { err "$CONF not found; this script targets Debian/Ubuntu"; exit 3; }
+
 PY=$(command -v python3 || command -v python || true)
+[[ -n "$PY" ]] || { err "python3 required"; exit 3; }
 
-echo "=== emSign: keep G3 blocked, restore C3/C1/G1 ==="
-
-# ---------------------------------------------------------------
-# 0. 源证书是否还在（否则 --fresh 也生成不回来）
-# ---------------------------------------------------------------
-missing=0
-for f in \
-  /usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_G3.crt \
-  /usr/share/ca-certificates/mozilla/emSign_ECC_Root_CA_-_C3.crt \
-  /usr/share/ca-certificates/mozilla/emSign_Root_CA_-_C1.crt \
-  /usr/share/ca-certificates/mozilla/emSign_Root_CA_-_G1.crt ; do
-  [[ -f "$f" ]] || { echo "[x] missing: $f"; missing=1; }
+for f in emSign_ECC_Root_CA_-_C3.crt \
+         emSign_Root_CA_-_C1.crt \
+         emSign_Root_CA_-_G1.crt; do
+    if [[ ! -f "$SRC/$f" ]]; then
+        err "source missing: $SRC/$f"
+        err "reinstall first: apt-get install --reinstall ca-certificates"
+        exit 2
+    fi
 done
-if [[ $missing -eq 1 ]]; then
-  echo "[!] reinstall ca-certificates first:"
-  echo "    apt-get install --reinstall ca-certificates"
-  exit 2
-fi
 
-# ---------------------------------------------------------------
-# 1. 备份
-# ---------------------------------------------------------------
+# ---- backup ----------------------------------------------------------------
 mkdir -p "$BK"
 cp -a "$CONF" "$BK/" 2>/dev/null || true
-[[ -f "$BUNDLE" ]] && cp -a "$BUNDLE" "$BK/" || true
-echo "[+] backup: $BK"
+[[ -f "$BUNDLE" ]] && cp -a "$BUNDLE" "$BK/" 2>/dev/null || true
+info "backup: $BK"
 
-# ---------------------------------------------------------------
-# 2. 改 ca-certificates.conf
-#    - G3: 确保带 ! 前缀
-#    - C3 / C1 / G1: 去掉 ! 前缀
-# ---------------------------------------------------------------
-if [[ -n "$PY" ]]; then
-  "$PY" - "$CONF" <<'PY'
-import sys
+# ---- normalize conf --------------------------------------------------------
+# G3 must be prefixed with '!'; C3/C1/G1 must not. Missing entries are added.
+"$PY" - "$CONF" <<'PY'
+import os, sys
 p = sys.argv[1]
+targets = {
+    'emSign_ECC_Root_CA_-_G3.crt': True,    # True = block
+    'emSign_ECC_Root_CA_-_C3.crt': False,
+    'emSign_Root_CA_-_C1.crt':     False,
+    'emSign_Root_CA_-_G1.crt':     False,
+}
+low2orig = {k.lower(): (k, v) for k, v in targets.items()}
+
 with open(p, encoding='utf-8', errors='ignore') as f:
     lines = f.readlines()
-out, g3, rest = [], 0, 0
+
+out, seen = [], set()
 for line in lines:
     s = line.lstrip()
-    if s.startswith('#'):
+    if not s.strip() or s.startswith('#'):
         out.append(line); continue
     indent = line[:len(line)-len(s)]
     bang = s.startswith('!')
-    body = s[1:] if bang else s
-    low = body.lower()
-    if 'emsign' not in low:
+    body = (s[1:] if bang else s).rstrip('\n')
+    base = os.path.basename(body).lower()
+    if base not in low2orig:
         out.append(line); continue
-    if 'g3' in low:
-        out.append(indent + ('!' + body if not bang else body))
-        g3 += 1
-    else:
-        out.append(indent + body)
-        rest += 1
+    seen.add(base)
+    blocked = low2orig[base][1]
+    out.append(indent + ('!' if blocked else '') + body + '\n')
+
+for base, (orig, blocked) in low2orig.items():
+    if base in seen:
+        continue
+    out.append(('!' if blocked else '') + 'mozilla/' + orig + '\n')
+
 with open(p, 'w', encoding='utf-8') as f:
     f.writelines(out)
-print(f"    g3 blocked={g3}, restored={rest}")
+print(f"    normalized {len(seen)} existing, added {len(targets)-len(seen)} missing")
 PY
-else
-  # 无 python 时的 sed 兜底（只处理 mozilla/ 命名）
-  sed -i -E 's|^([[:space:]]*)mozilla/emSign_ECC_Root_CA_-_G3|!mozilla/emSign_ECC_Root_CA_-_G3|' "$CONF"
-  sed -i -E 's|^!([[:space:]]*mozilla/emSign_(ECC_)?Root_CA_-_(C3|C1|G1))|\1|' "$CONF"
-  echo "    (sed fallback applied)"
-fi
+ok "updated $CONF"
 
-# ---------------------------------------------------------------
-# 3. 重新生成 bundle
-# ---------------------------------------------------------------
-if command -v update-ca-certificates >/dev/null 2>&1; then
-  update-ca-certificates --fresh >/dev/null 2>&1 \
-    || update-ca-certificates >/dev/null 2>&1 || true
-  echo "[+] regenerated ca-certificates bundle"
+# ---- regenerate bundle (errors are NOT swallowed) --------------------------
+info "running update-ca-certificates --fresh"
+if ! update-ca-certificates --fresh; then
+    err "update-ca-certificates --fresh failed; backup at $BK"
+    exit 2
 fi
+ok "regenerated CA bundle"
 
-# ---------------------------------------------------------------
-# 4. 自校验
-# ---------------------------------------------------------------
-echo
-echo "--- $CONF ---"
-grep -i emsign "$CONF" || echo "  (no emSign lines)"
-echo
-echo "--- $BUNDLE ---"
+# ---- verify via symlinks (ground truth) ------------------------------------
 rc=0
-for n in \
-  "emSign ECC Root CA - C3" \
-  "emSign Root CA - C1" \
-  "emSign Root CA - G1" \
-  "emSign ECC Root CA - G3" ; do
-  c=$(grep -c -- "$n" "$BUNDLE" 2>/dev/null || true); c=${c:-0}
-  printf "  %-30s : %s\n" "$n" "$c"
-  if [[ "$n" == *G3 && "$c" != "0" ]]; then rc=2; fi
-  if [[ "$n" != *G3 && "$c" == "0" ]]; then rc=2; fi
+for pair in "C3:emSign_ECC_Root_CA_-_C3.pem" \
+            "C1:emSign_Root_CA_-_C1.pem" \
+            "G1:emSign_Root_CA_-_G1.pem"; do
+    name="${pair%%:*}"; file="${pair##*:}"
+    if [[ -e "$CERTS/$file" ]]; then
+        ok "$name trusted ($CERTS/$file)"
+    else
+        err "$name MISSING: $CERTS/$file"
+        rc=2
+    fi
 done
+
+if [[ -e "$CERTS/emSign_ECC_Root_CA_-_G3.pem" ]]; then
+    err "G3 still trusted: $CERTS/emSign_ECC_Root_CA_-_G3.pem"
+    rc=2
+else
+    ok "G3 blocked"
+fi
 
 echo
 if [[ $rc -eq 0 ]]; then
-  echo "[+] done. G3 blocked; C3 / C1 / G1 restored."
-  echo "[+] rollback: cp -a $BK/* /etc/ && update-ca-certificates --fresh"
+    ok "SUCCESS: G3 blocked; C3 / C1 / G1 trusted"
+    info "rollback: cp -a $BK/* /etc/ && update-ca-certificates --fresh"
 else
-  echo "[x] verification mismatch, backup at $BK"
-  exit 2
+    err "verification failed; backup at $BK"
 fi
+exit $rc
